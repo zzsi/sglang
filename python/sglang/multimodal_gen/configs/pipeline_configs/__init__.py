@@ -12,6 +12,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     FastHunyuanConfig,
     HunyuanConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan_avatar import (
+    HunyuanAvatarConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     SelfForcingWanT2V480PConfig,
     WanI2V480PConfig,
@@ -24,6 +27,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipeline
 __all__ = [
     "HunyuanConfig",
     "FastHunyuanConfig",
+    "HunyuanAvatarConfig",
     "FluxPipelineConfig",
     "Flux2FinetunedPipelineConfig",
     "PipelineConfig",

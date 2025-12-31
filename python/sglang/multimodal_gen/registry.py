@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
+    HunyuanAvatarConfig,
     HunyuanConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
@@ -45,6 +46,9 @@ from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
 from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.hunyuan_avatar import (
+    HunyuanAvatarSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageEditPlusSamplingParams,
@@ -309,6 +313,18 @@ def _register_configs():
         pipeline_config_cls=FastHunyuanConfig,
         hf_model_paths=[
             "FastVideo/FastHunyuan-diffusers",
+        ],
+    )
+
+    # HunyuanVideo-Avatar
+    register_configs(
+        sampling_param_cls=HunyuanAvatarSamplingParams,
+        pipeline_config_cls=HunyuanAvatarConfig,
+        hf_model_paths=[
+            "tencent/HunyuanVideo-Avatar",
+        ],
+        model_detectors=[
+            lambda hf_id: "hunyuan" in hf_id.lower() and "avatar" in hf_id.lower()
         ],
     )
 
