@@ -590,22 +590,26 @@ class ServerArgs:
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
     def settle_port(
-        self, port: int, port_inc: int = 42, max_attempts: int = 100
-    ) -> int:
+        self, port: int | None, port_inc: int = 42, max_attempts: int = 100
+    ) -> int | None:
         """
         Find an available port with retry logic.
 
         Args:
-            port: Initial port to check
+            port: Initial port to check (None for local mode)
             port_inc: Port increment for each attempt
             max_attempts: Maximum number of attempts to find an available port
 
         Returns:
-            An available port number
+            An available port number, or None if port was None (local mode)
 
         Raises:
             RuntimeError: If no available port is found after max_attempts
         """
+        # In local mode, port can be None - return as is
+        if port is None:
+            return None
+
         attempts = 0
         original_port = port
 
