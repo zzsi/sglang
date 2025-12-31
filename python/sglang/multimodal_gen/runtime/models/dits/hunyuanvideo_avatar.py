@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
 from sglang.multimodal_gen.configs.models.dits.hunyuanvideo import (
@@ -268,6 +269,35 @@ class HunyuanVideoAvatarTransformer(CachableDiT, OffloadableDiTMixin):
             for adapter_idx, layer_idx in enumerate(self.audio_injection_layers)
         }
 
+        # ==================== Motion/FPS components ====================
+        # These provide additional control over expression, pose, and frame rate
+
+        # FPS conditioning (outputs full hidden_size = 3072)
+        self.fps_proj = TimestepEmbedder(
+            self.hidden_size,
+            act_layer="silu",
+            dtype=config.dtype,
+            prefix=f"{config.prefix}.fps_proj",
+        )
+
+        # Motion expression control (outputs hidden_size // 4 = 768)
+        # Original checkpoint has: 256 -> 768 -> 768
+        self.motion_exp = TimestepEmbedder(
+            self.hidden_size // 4,  # 768
+            act_layer="silu",
+            dtype=config.dtype,
+            prefix=f"{config.prefix}.motion_exp",
+        )
+
+        # Motion pose control (outputs hidden_size // 4 = 768)
+        self.motion_pose = TimestepEmbedder(
+            self.hidden_size // 4,  # 768
+            act_layer="silu",
+            dtype=config.dtype,
+            prefix=f"{config.prefix}.motion_pose",
+        )
+
+
         self.__post_init__()
         self.layer_names = ["double_blocks", "single_blocks"]
 
@@ -281,6 +311,10 @@ class HunyuanVideoAvatarTransformer(CachableDiT, OffloadableDiTMixin):
         # Avatar-specific inputs
         ref_latents: torch.Tensor | None = None,
         audio_embeds: torch.Tensor | None = None,
+        # Motion/FPS control inputs
+        fps: torch.Tensor | None = None,
+        motion_exp: torch.Tensor | None = None,
+        motion_pose: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -293,6 +327,9 @@ class HunyuanVideoAvatarTransformer(CachableDiT, OffloadableDiTMixin):
             guidance: Guidance scale for CFG
             ref_latents: Reference image latents [B, C, T_ref, H, W] (typically T_ref >= 1)
             audio_embeds: Audio embeddings [B, num_frames, seq_len, blocks, channels]
+            fps: Frame rate value [B] (default: 24.0)
+            motion_exp: Expression intensity [B] (default: 1.0, range 0-2)
+            motion_pose: Pose intensity [B] (default: 1.0, range 0-2)
 
         Returns:
             Denoised output tensor
@@ -339,6 +376,37 @@ class HunyuanVideoAvatarTransformer(CachableDiT, OffloadableDiTMixin):
         if self.guidance_in and guidance is not None:
             vec = vec + self.guidance_in(guidance)
 
+        # Add motion/FPS modulation
+        if fps is not None:
+            vec = vec + self.fps_proj(fps)
+        else:
+            # Default FPS of 24
+            default_fps = torch.tensor([24.0], device=hidden_states.device, dtype=hidden_states.dtype)
+            default_fps = default_fps.expand(batch_size)
+            vec = vec + self.fps_proj(default_fps)
+
+        # Motion embeddings output 768-dim (hidden_size // 4)
+        # We tile them 4x to 3072-dim to match vec
+        if motion_exp is not None:
+            motion_exp_emb = self.motion_exp(motion_exp)  # [B, 768]
+        else:
+            # Default expression intensity of 30.0 (matches original hardcoded value)
+            default_exp = torch.tensor([30.0], device=hidden_states.device, dtype=hidden_states.dtype)
+            default_exp = default_exp.expand(batch_size)
+            motion_exp_emb = self.motion_exp(default_exp)  # [B, 768]
+        # Tile to match hidden_size: [B, 768] -> [B, 3072]
+        vec = vec + motion_exp_emb.repeat(1, 4)
+
+        if motion_pose is not None:
+            motion_pose_emb = self.motion_pose(motion_pose)  # [B, 768]
+        else:
+            # Default pose intensity of 25.0 (matches original hardcoded value)
+            default_pose = torch.tensor([25.0], device=hidden_states.device, dtype=hidden_states.dtype)
+            default_pose = default_pose.expand(batch_size)
+            motion_pose_emb = self.motion_pose(default_pose)  # [B, 768]
+        # Tile to match hidden_size: [B, 768] -> [B, 3072]
+        vec = vec + motion_pose_emb.repeat(1, 4)
+
         # Embed image
         img = self.img_in(img)
 
@@ -377,10 +445,22 @@ class HunyuanVideoAvatarTransformer(CachableDiT, OffloadableDiTMixin):
             # audio_context: [B, num_frames, context_tokens, hidden_size]
             audio_context = self.audio_proj(audio_embeds)
 
-            # Pad audio with 3 repeated copies of first frame at the start
-            # This aligns audio frames with video frames
-            audio_pad = audio_context[:, :1].repeat(1, 3, 1, 1)
-            audio_context = torch.cat([audio_pad, audio_context], dim=1)
+            # For perceiver cross-attention, audio frames must match video latent frames
+            # If audio is at video frame rate (ot), downsample to latent rate (tt)
+            audio_frames = audio_context.shape[1]
+            if audio_frames > tt:
+                # Downsample audio from video frame rate to latent frame rate
+                # audio_context: [B, frames, tokens, dim]
+                B_audio, num_audio_frames, num_tokens, audio_dim = audio_context.shape
+                # Reshape for 1D interpolation: [B * tokens * dim, 1, frames]
+                audio_context = audio_context.permute(0, 2, 3, 1)  # [B, tokens, dim, frames]
+                audio_context = audio_context.reshape(B_audio * num_tokens * audio_dim, 1, num_audio_frames)
+                audio_context = F.interpolate(
+                    audio_context.float(), size=tt, mode='linear', align_corners=False
+                ).to(audio_context.dtype)
+                # Reshape back: [B*tokens*dim, 1, tt] -> [B, tt, tokens, dim]
+                audio_context = audio_context.reshape(B_audio, num_tokens, audio_dim, tt)
+                audio_context = audio_context.permute(0, 3, 1, 2)  # [B, tt, tokens, dim]
 
         # Process through double stream blocks
         for layer_idx, block in enumerate(self.double_blocks):
@@ -435,6 +515,107 @@ class HunyuanVideoAvatarTransformer(CachableDiT, OffloadableDiTMixin):
         img = unpatchify(img, tt, th, tw, self.patch_size, self.out_channels)
 
         return img
+
+
+    @staticmethod
+    def remap_checkpoint_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """
+        Remap checkpoint keys from original HunyuanVideo-Avatar format to SGLang format.
+
+        The original checkpoint uses different naming conventions:
+        - MLP layers: fc1/fc2 vs fc_in/fc_out
+        - Sequential layers: indexed (0, 2) vs named (fc_in, fc_out)
+        - txt_in structure: individual_token_refiner.blocks vs refiner_blocks
+
+        Args:
+            state_dict: Original checkpoint state dict
+
+        Returns:
+            Remapped state dict compatible with SGLang model
+        """
+        remapped = {}
+
+        for key, value in state_dict.items():
+            new_key = key
+
+            # time_in uses indexed naming (0, 2) -> (fc_in, fc_out)
+            new_key = new_key.replace('time_in.mlp.0.', 'time_in.mlp.fc_in.')
+            new_key = new_key.replace('time_in.mlp.2.', 'time_in.mlp.fc_out.')
+
+            # fps_proj uses indexed naming
+            new_key = new_key.replace('fps_proj.mlp.0.', 'fps_proj.mlp.fc_in.')
+            new_key = new_key.replace('fps_proj.mlp.2.', 'fps_proj.mlp.fc_out.')
+
+            # motion_exp uses indexed naming
+            new_key = new_key.replace('motion_exp.mlp.0.', 'motion_exp.mlp.fc_in.')
+            new_key = new_key.replace('motion_exp.mlp.2.', 'motion_exp.mlp.fc_out.')
+
+            # motion_pose uses indexed naming
+            new_key = new_key.replace('motion_pose.mlp.0.', 'motion_pose.mlp.fc_in.')
+            new_key = new_key.replace('motion_pose.mlp.2.', 'motion_pose.mlp.fc_out.')
+
+            # txt_in.t_embedder uses indexed naming
+            new_key = new_key.replace('txt_in.t_embedder.mlp.0.', 'txt_in.t_embedder.mlp.fc_in.')
+            new_key = new_key.replace('txt_in.t_embedder.mlp.2.', 'txt_in.t_embedder.mlp.fc_out.')
+
+            # txt_in structure
+            new_key = new_key.replace('txt_in.c_embedder.linear_1.', 'txt_in.c_embedder.fc_in.')
+            new_key = new_key.replace('txt_in.c_embedder.linear_2.', 'txt_in.c_embedder.fc_out.')
+            new_key = new_key.replace('txt_in.individual_token_refiner.input_embedder.', 'txt_in.input_embedder.')
+            new_key = new_key.replace('txt_in.individual_token_refiner.blocks.', 'txt_in.refiner_blocks.')
+
+            # vector_in uses in_layer/out_layer -> fc_in/fc_out
+            new_key = new_key.replace('vector_in.in_layer.', 'vector_in.fc_in.')
+            new_key = new_key.replace('vector_in.out_layer.', 'vector_in.fc_out.')
+
+            # final_layer adaLN uses indexed naming
+            new_key = new_key.replace('final_layer.adaLN_modulation.1.', 'final_layer.adaLN_modulation.linear.')
+
+            # Generic MLP naming for blocks (fc1/fc2 -> fc_in/fc_out)
+            new_key = new_key.replace('.mlp.fc1.', '.mlp.fc_in.')
+            new_key = new_key.replace('.mlp.fc2.', '.mlp.fc_out.')
+
+            # img_mlp and txt_mlp in double_blocks
+            new_key = new_key.replace('.img_mlp.fc1.', '.img_mlp.fc_in.')
+            new_key = new_key.replace('.img_mlp.fc2.', '.img_mlp.fc_out.')
+            new_key = new_key.replace('.txt_mlp.fc1.', '.txt_mlp.fc_in.')
+            new_key = new_key.replace('.txt_mlp.fc2.', '.txt_mlp.fc_out.')
+
+            # adaLN in refiner blocks
+            new_key = new_key.replace('.adaLN_modulation.1.', '.adaLN_modulation.linear.')
+
+            remapped[new_key] = value
+
+        return remapped
+
+    def load_weights(
+        self,
+        weights: dict[str, torch.Tensor],
+        prefix: str = "",
+        remap_keys: bool = True,
+    ) -> tuple[list[str], list[str]]:
+        """
+        Load weights with automatic key remapping.
+
+        Args:
+            weights: State dict to load
+            prefix: Optional prefix to strip from keys
+            remap_keys: Whether to remap keys from original format
+
+        Returns:
+            Tuple of (missing_keys, unexpected_keys)
+        """
+        if remap_keys:
+            weights = self.remap_checkpoint_keys(weights)
+
+        if prefix:
+            weights = {
+                k[len(prefix):] if k.startswith(prefix) else k: v
+                for k, v in weights.items()
+            }
+
+        missing, unexpected = self.load_state_dict(weights, strict=False)
+        return missing, unexpected
 
 
 # Entry point for model loading

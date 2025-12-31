@@ -32,9 +32,11 @@ class HunyuanAvatarSamplingParams(HunyuanSamplingParams):
     # Shape: (num_frames, seq_len, blocks, channels)
     audio_embeds: np.ndarray | None = None
 
-    # Motion control (optional, not implemented in Phase 2)
-    # motion_exp: float | None = None  # Expression intensity
-    # motion_pose: float | None = None  # Pose intensity
+    # Motion control (optional) - these match the original hardcoded defaults
+    # Expression intensity (original default: 30.0)
+    motion_exp: float = 30.0
+    # Pose intensity (original default: 25.0)
+    motion_pose: float = 25.0
 
     # Avatar-specific supported resolutions
     supported_resolutions: list[tuple[int, int]] | None = field(
@@ -91,5 +93,10 @@ class HunyuanAvatarSamplingParams(HunyuanSamplingParams):
                 extra["audio_embeds"] = torch.from_numpy(self.audio_embeds)
             else:
                 extra["audio_embeds"] = self.audio_embeds
+
+        # Motion/FPS control
+        extra["fps"] = float(self.fps)
+        extra["motion_exp"] = self.motion_exp
+        extra["motion_pose"] = self.motion_pose
 
         return extra
