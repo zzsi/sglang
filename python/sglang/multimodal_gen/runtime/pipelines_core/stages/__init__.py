@@ -39,6 +39,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation im
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.avatar_encoding import (
     AudioEncodingStage,
+    AvatarTextEncodingStage,
+    CLIPTextEncoder,
+    LLaVATextEncoder,
     ReferenceImageEncodingStage,
     WhisperAudioEncoder,
 )
@@ -58,6 +61,9 @@ __all__ = [
     "ImageVAEEncodingStage",
     "TextEncodingStage",
     "AudioEncodingStage",
+    "AvatarTextEncodingStage",
     "ReferenceImageEncodingStage",
     "WhisperAudioEncoder",
+    "LLaVATextEncoder",
+    "CLIPTextEncoder",
 ]

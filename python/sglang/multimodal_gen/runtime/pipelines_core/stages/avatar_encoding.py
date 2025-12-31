@@ -6,6 +6,9 @@ This module contains stages for encoding reference images and audio
 for avatar generation.
 """
 
+from typing import Optional
+
+import numpy as np
 import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -321,6 +324,458 @@ class WhisperAudioEncoder:
 
         # Final shape: (batch, num_frames, 10, 5, 384)
         return audio_prompts
+
+
+class LLaVATextEncoder:
+    """
+    LLaVA-based text encoder for HunyuanVideo-Avatar.
+
+    Encodes text + reference image into hidden states using LLaVA-LLaMA-3-8B.
+    The reference image provides facial identity information to the text embeddings.
+    """
+
+    # Prompt template matching original HunyuanVideo-Avatar
+    PROMPT_TEMPLATE = (
+        "<|start_header_id|>system<|end_header_id|>\n\nDescribe the video by detailing the following aspects: "
+        "1. The main content and theme of the video."
+        "2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects."
+        "3. Actions, events, behaviors temporal relationships, physical movement changes of the objects."
+        "4. background environment, light, style and atmosphere."
+        "5. camera angles, movements, and transitions used in the video:<|eot_id|>"
+        "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>"
+    )
+    CROP_START = 95  # Remove instruction tokens, keep only prompt tokens
+
+    def __init__(self, model_path: str, precision: str = "fp16"):
+        """
+        Initialize LLaVA encoder.
+
+        Args:
+            model_path: Path to LLaVA model
+            precision: Model precision ("fp16", "bf16", or "fp32")
+        """
+        from transformers import LlavaForConditionalGeneration, LlamaTokenizerFast
+
+        self.model_path = model_path
+        self.precision = precision
+        self.dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[precision]
+
+        logger.info(f"Loading LLaVA encoder from {model_path}")
+        self.model = LlavaForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=self.dtype,
+            low_cpu_mem_usage=True,
+        )
+        self.model.eval()
+        self.model.requires_grad_(False)
+
+        # Get the final layer norm for hidden state processing
+        # The structure varies: language_model.model.norm or language_model.norm
+        if hasattr(self.model.language_model, 'model'):
+            self.final_layer_norm = self.model.language_model.model.norm
+        else:
+            self.final_layer_norm = self.model.language_model.norm
+
+        self.tokenizer = LlamaTokenizerFast.from_pretrained(
+            model_path,
+            padding_side="right",
+        )
+
+        # Image processor for LLaVA's CLIP vision encoder
+        from transformers import AutoProcessor
+        try:
+            processor = AutoProcessor.from_pretrained(model_path)
+            self.image_processor = processor.image_processor
+        except Exception:
+            from transformers import CLIPImageProcessor
+            self.image_processor = CLIPImageProcessor.from_pretrained(model_path)
+
+        self.device = None
+
+        # Number of image tokens that LLaVA uses (576 patches for 336x336 with patch_size=14)
+        # Plus some additional tokens for separators = 575
+        self.num_image_tokens = 575
+
+    def to(self, device):
+        """Move model to device."""
+        self.device = device
+        self.model = self.model.to(device)
+        return self
+
+    def preprocess_image(self, image: PIL.Image.Image) -> torch.Tensor:
+        """
+        Preprocess image for LLaVA's CLIP vision encoder.
+
+        Matches original HunyuanVideo-Avatar preprocessing:
+        - Resize to 336x336 (bilinear)
+        - ToTensor (0-255 -> 0-1)
+        - Normalize with CLIP mean/std
+
+        Args:
+            image: PIL Image (reference portrait)
+
+        Returns:
+            Tensor of shape (1, 3, 336, 336)
+        """
+        from torchvision import transforms
+
+        # Exact transform from original HunyuanVideo-Avatar
+        llava_transform = transforms.Compose([
+            transforms.Resize(
+                (336, 336),
+                interpolation=transforms.InterpolationMode.BILINEAR
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.48145466, 0.4578275, 0.4082107),
+                std=(0.26862954, 0.26130258, 0.27577711)
+            ),
+        ])
+
+        # Apply transform and add batch dimension
+        pixel_values = llava_transform(image).unsqueeze(0)
+
+        return pixel_values.to(self.device, dtype=self.dtype)
+
+    def encode(
+        self,
+        text: str,
+        image: Optional[PIL.Image.Image] = None,
+        max_length: int = 256,
+        hidden_state_skip_layer: int = 2,
+        apply_final_norm: bool = True,
+    ) -> torch.Tensor:
+        """
+        Encode text (and optionally image) to hidden states.
+
+        Args:
+            text: Text prompt
+            image: Optional reference image for identity injection
+            max_length: Maximum token length
+            hidden_state_skip_layer: Number of layers to skip from the end (0 = last layer)
+            apply_final_norm: Whether to apply final layer norm to intermediate layers
+
+        Returns:
+            Hidden states tensor of shape (batch, seq_len, hidden_dim=4096)
+        """
+        # Apply prompt template
+        formatted_text = self.PROMPT_TEMPLATE.format(text)
+
+        # Add image placeholder if image is provided
+        # Following original HunyuanVideo-Avatar pattern
+        if image is not None:
+            formatted_text = formatted_text + "\nThe person looks like<image>"
+
+        # Tokenize
+        text_inputs = self.tokenizer(
+            formatted_text,
+            truncation=True,
+            max_length=max_length,
+            padding="max_length",
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+
+        input_ids = text_inputs["input_ids"].to(self.device)
+        attention_mask = text_inputs["attention_mask"].to(self.device)
+
+        with torch.no_grad():
+            if image is not None:
+                # Process image and get vision features manually
+                pixel_values = self.preprocess_image(image)
+
+                # Get image features from vision encoder
+                image_outputs = self.model.vision_tower(
+                    pixel_values,
+                    output_hidden_states=True
+                )
+                # Use the second-to-last layer as per vision_feature_layer=-2
+                selected_image_feature = image_outputs.hidden_states[-2]
+
+                # Project through multi-modal projector
+                image_features = self.model.multi_modal_projector(selected_image_feature)
+                # image_features shape: (1, 576, 4096)
+
+                # Get text embeddings
+                inputs_embeds = self.model.get_input_embeddings()(input_ids)
+
+                # Find <image> token position and replace with image features
+                image_token_id = self.model.config.image_token_index  # 128257
+                image_token_mask = input_ids == image_token_id
+
+                # Build the combined embeddings
+                # Replace the single <image> token with 576 image patch embeddings
+                batch_size = input_ids.shape[0]
+                new_embeds_list = []
+                new_attention_list = []
+
+                for b in range(batch_size):
+                    image_positions = torch.where(image_token_mask[b])[0]
+                    if len(image_positions) > 0:
+                        pos = image_positions[0].item()
+                        # Before image token
+                        before = inputs_embeds[b, :pos]
+                        before_mask = attention_mask[b, :pos]
+                        # Image features
+                        img_feats = image_features[b]  # (576, 4096)
+                        img_mask = torch.ones(img_feats.shape[0], device=self.device, dtype=attention_mask.dtype)
+                        # After image token (skip the <image> token itself)
+                        after = inputs_embeds[b, pos + 1:]
+                        after_mask = attention_mask[b, pos + 1:]
+                        # Concatenate
+                        new_embed = torch.cat([before, img_feats, after], dim=0)
+                        new_mask = torch.cat([before_mask, img_mask, after_mask], dim=0)
+                    else:
+                        new_embed = inputs_embeds[b]
+                        new_mask = attention_mask[b]
+
+                    new_embeds_list.append(new_embed)
+                    new_attention_list.append(new_mask)
+
+                # Stack and potentially truncate/pad to max length
+                max_len = max(e.shape[0] for e in new_embeds_list)
+                final_embeds = torch.zeros(batch_size, max_len, inputs_embeds.shape[-1],
+                                          device=self.device, dtype=inputs_embeds.dtype)
+                final_attention = torch.zeros(batch_size, max_len,
+                                             device=self.device, dtype=attention_mask.dtype)
+
+                for b, (emb, mask) in enumerate(zip(new_embeds_list, new_attention_list)):
+                    seq_len = min(emb.shape[0], max_len)
+                    final_embeds[b, :seq_len] = emb[:seq_len]
+                    final_attention[b, :seq_len] = mask[:seq_len]
+
+                # Forward through language model with inputs_embeds
+                outputs = self.model.language_model(
+                    inputs_embeds=final_embeds,
+                    attention_mask=final_attention,
+                    output_hidden_states=True,
+                )
+            else:
+                # Text-only encoding through language model
+                outputs = self.model.language_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
+
+        # Get hidden states from specified layer
+        hidden_states = outputs.hidden_states
+        if hidden_state_skip_layer > 0:
+            last_hidden_state = hidden_states[-(hidden_state_skip_layer + 1)]
+            # Apply final layer norm for intermediate layers
+            if apply_final_norm:
+                last_hidden_state = self.final_layer_norm(last_hidden_state)
+        else:
+            last_hidden_state = hidden_states[-1]
+
+        # Crop instruction tokens (keep only prompt tokens)
+        if self.CROP_START > 0:
+            last_hidden_state = last_hidden_state[:, self.CROP_START:]
+
+        return last_hidden_state
+
+
+class CLIPTextEncoder:
+    """
+    CLIP text encoder for pooled embeddings.
+
+    Used alongside LLaVA to provide pooled text representations.
+    """
+
+    def __init__(self, model_path: str, precision: str = "fp16"):
+        """
+        Initialize CLIP text encoder.
+
+        Args:
+            model_path: Path to CLIP model
+            precision: Model precision
+        """
+        from transformers import CLIPTextModel, CLIPTokenizer
+
+        self.model_path = model_path
+        self.precision = precision
+        self.dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[precision]
+
+        logger.info(f"Loading CLIP text encoder from {model_path}")
+        self.model = CLIPTextModel.from_pretrained(model_path)
+        self.model.eval()
+        self.model.requires_grad_(False)
+        self.model = self.model.to(self.dtype)
+
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_path, max_length=77)
+        self.device = None
+
+    def to(self, device):
+        """Move model to device."""
+        self.device = device
+        self.model = self.model.to(device)
+        return self
+
+    def encode(self, text: str) -> torch.Tensor:
+        """
+        Encode text to pooled embedding.
+
+        Args:
+            text: Text prompt
+
+        Returns:
+            Pooled embedding tensor of shape (batch, 768)
+        """
+        # Tokenize
+        text_inputs = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=77,
+            padding="max_length",
+            return_tensors="pt",
+        )
+
+        input_ids = text_inputs["input_ids"].to(self.device)
+        attention_mask = text_inputs["attention_mask"].to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+
+        # Return pooler output (CLS token embedding)
+        return outputs.pooler_output
+
+
+class AvatarTextEncodingStage(PipelineStage):
+    """
+    Combined text encoding stage for HunyuanVideo-Avatar.
+
+    Uses LLaVA for main hidden states (with reference image injection)
+    and CLIP for pooled embeddings.
+    """
+
+    def __init__(
+        self,
+        llava_path: Optional[str] = None,
+        clip_path: Optional[str] = None,
+        precision: str = "fp16",
+        **kwargs,
+    ) -> None:
+        """
+        Initialize avatar text encoding stage.
+
+        Args:
+            llava_path: Path to LLaVA model
+            clip_path: Path to CLIP model
+            precision: Model precision
+        """
+        super().__init__()
+        self.llava_path = llava_path
+        self.clip_path = clip_path
+        self.precision = precision
+        self._llava_encoder: Optional[LLaVATextEncoder] = None
+        self._clip_encoder: Optional[CLIPTextEncoder] = None
+
+    def _get_llava_encoder(self) -> Optional[LLaVATextEncoder]:
+        """Lazily initialize LLaVA encoder."""
+        if self._llava_encoder is not None:
+            return self._llava_encoder
+        if self.llava_path is not None:
+            self._llava_encoder = LLaVATextEncoder(self.llava_path, self.precision)
+            return self._llava_encoder
+        return None
+
+    def _get_clip_encoder(self) -> Optional[CLIPTextEncoder]:
+        """Lazily initialize CLIP encoder."""
+        if self._clip_encoder is not None:
+            return self._clip_encoder
+        if self.clip_path is not None:
+            self._clip_encoder = CLIPTextEncoder(self.clip_path, self.precision)
+            return self._clip_encoder
+        return None
+
+    def load_model(self):
+        llava = self._get_llava_encoder()
+        if llava is not None:
+            llava.to(get_local_torch_device())
+
+        clip = self._get_clip_encoder()
+        if clip is not None:
+            clip.to(get_local_torch_device())
+
+    def offload_model(self):
+        if self._llava_encoder is not None:
+            self._llava_encoder.to("cpu")
+        if self._clip_encoder is not None:
+            self._clip_encoder.to("cpu")
+        torch.cuda.empty_cache()
+
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        """
+        Encode text with LLaVA (+ reference image) and CLIP.
+
+        Args:
+            batch: The current batch information.
+            server_args: The inference arguments.
+
+        Returns:
+            The batch with prompt embeddings populated.
+        """
+        prompt = batch.prompt
+        if prompt is None:
+            prompt = ""
+
+        # Get reference image for LLaVA
+        ref_image = batch.extra.get("ref_image", batch.condition_image)
+
+        self.load_model()
+
+        # Encode with LLaVA
+        llava = self._get_llava_encoder()
+        if llava is not None:
+            hidden_states = llava.encode(prompt, image=ref_image)
+            batch.prompt_embeds.append(hidden_states)
+            logger.debug(f"LLaVA hidden states shape: {hidden_states.shape}")
+
+            # Encode negative prompt if CFG is enabled
+            if batch.do_classifier_free_guidance:
+                neg_prompt = batch.negative_prompt or ""
+                # For negative, don't include image (or use zeros)
+                neg_hidden_states = llava.encode(neg_prompt, image=None)
+                if batch.negative_prompt_embeds is not None:
+                    batch.negative_prompt_embeds.append(neg_hidden_states)
+
+        # Encode with CLIP for pooled embeddings
+        clip = self._get_clip_encoder()
+        if clip is not None:
+            pooled_embeds = clip.encode(prompt)
+            batch.pooled_embeds.append(pooled_embeds)
+            logger.debug(f"CLIP pooled embeds shape: {pooled_embeds.shape}")
+
+            if batch.do_classifier_free_guidance:
+                neg_prompt = batch.negative_prompt or ""
+                neg_pooled_embeds = clip.encode(neg_prompt)
+                batch.neg_pooled_embeds.append(neg_pooled_embeds)
+
+        self.offload_model()
+        return batch
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify text encoding stage inputs."""
+        result = VerificationResult()
+        result.add_check("prompt", batch.prompt, lambda x: x is None or isinstance(x, str))
+        return result
+
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify text encoding stage outputs."""
+        result = VerificationResult()
+        result.add_check(
+            "prompt_embeds",
+            batch.prompt_embeds,
+            lambda x: len(x) > 0,
+        )
+        return result
 
 
 class AudioEncodingStage(PipelineStage):
