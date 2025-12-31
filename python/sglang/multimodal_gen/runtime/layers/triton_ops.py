@@ -463,6 +463,9 @@ def _rotary_embedding_kernel(
 def apply_rotary_embedding(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
 ) -> torch.Tensor:
+    # Ensure x is contiguous for view operations (handles CFG batching with torch.cat)
+    if not x.is_contiguous():
+        x = x.contiguous()
     output = torch.empty_like(x)
 
     if x.dim() > 3:

@@ -245,6 +245,10 @@ class ScaleResidual(nn.Module):
                 x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
             ).flatten(1, 2)
         else:
+            # Auto-unsqueeze 2D gate tensors for proper broadcasting with batch > 1
+            # This handles [batch, hidden] -> [batch, 1, hidden] for CFG passes
+            if gate.dim() == 2:
+                gate = gate.unsqueeze(1)
             # gate.shape: [batch_size, 1, inner_dim]
             return residual + x * gate
 
@@ -337,7 +341,10 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                     x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
                 ).flatten(1, 2)
             else:
-                # used by bidirectional self attention
+                # Auto-unsqueeze 2D gate tensors for proper broadcasting with batch > 1
+                # This handles [batch, hidden] -> [batch, 1, hidden] for CFG passes
+                if gate.dim() == 2:
+                    gate = gate.unsqueeze(1)
                 # gate.shape: [batch_size, 1, inner_dim]
                 residual_output = residual + x * gate
         else:
@@ -403,6 +410,14 @@ class LayerNormScaleShift(nn.Module):
         normalized = self.norm(x)
         if self.compute_dtype == torch.float32:
             normalized = normalized.float()
+
+        # Auto-unsqueeze 2D tensors to 3D for proper broadcasting with batch > 1
+        # This handles cases where scale/shift come directly from modulation layers
+        # without explicit unsqueeze (e.g., [batch, hidden] -> [batch, 1, hidden])
+        if scale.dim() == 2:
+            scale = scale.unsqueeze(1)
+        if shift.dim() == 2:
+            shift = shift.unsqueeze(1)
 
         if scale.dim() == 4:
             # scale.shape: [batch_size, num_frames, 1, inner_dim]
