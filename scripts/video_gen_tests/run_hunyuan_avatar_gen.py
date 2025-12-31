@@ -25,11 +25,17 @@ MODEL_BASE = "/home/zsi/.cache/cvlization/hunyuanvideo_avatar/weights/ckpts"
 TRANSFORMER_PATH = f"{MODEL_BASE}/hunyuan-video-t2v-720p/transformers/"
 VAE_PATH = f"{MODEL_BASE}/hunyuan-video-t2v-720p/vae/"
 WHISPER_PATH = f"{MODEL_BASE}/whisper-tiny/"
+LLAVA_PATH = f"{MODEL_BASE}/llava_llama_image/"
+CLIP_PATH = f"{MODEL_BASE}/text_encoder_2/"
 
 # Sample inputs
 SAMPLE_IMAGE = "/tmp/HunyuanVideo-Avatar/assets/image/1.png"
 SAMPLE_AUDIO = "/tmp/HunyuanVideo-Avatar/assets/audio/2.WAV"
 OUTPUT_PATH = "/tmp/avatar_output.mp4"
+
+# Whether to use real text encoders (requires ~16GB extra VRAM for LLaVA)
+# Set to False to use dummy embeddings (for testing pipeline without text encoders)
+USE_REAL_TEXT_ENCODERS = True
 
 
 def init_distributed():
@@ -66,21 +72,23 @@ def init_distributed():
     return server_args
 
 
-def load_models():
+def load_models(load_text_encoders=True):
     """Load all required models."""
     print("\n" + "=" * 60)
     print("Loading Models")
     print("=" * 60)
 
+    num_models = 5 if load_text_encoders else 3
+
     # 1. Whisper
-    print("\n[1/3] Loading Whisper...")
+    print(f"\n[1/{num_models}] Loading Whisper...")
     from sglang.multimodal_gen.runtime.pipelines_core.stages import WhisperAudioEncoder
     whisper = WhisperAudioEncoder(WHISPER_PATH)
     whisper.to("cuda")
     print(f"  Whisper loaded")
 
     # 2. Transformer
-    print("\n[2/3] Loading Avatar Transformer...")
+    print(f"\n[2/{num_models}] Loading Avatar Transformer...")
     from sglang.multimodal_gen.runtime.models.dits.hunyuanvideo_avatar import (
         HunyuanVideoAvatarTransformer,
         HunyuanVideoAvatarConfig,
@@ -98,7 +106,7 @@ def load_models():
     print(f"  Transformer loaded: {sum(p.numel() for p in transformer.parameters()) / 1e9:.2f}B params")
 
     # 3. VAE
-    print("\n[3/3] Loading VAE...")
+    print(f"\n[3/{num_models}] Loading VAE...")
     from diffusers import AutoencoderKLHunyuanVideo
     vae = AutoencoderKLHunyuanVideo(
         in_channels=3,
@@ -130,7 +138,25 @@ def load_models():
     vae.eval()
     print(f"  VAE loaded: {sum(p.numel() for p in vae.parameters()) / 1e6:.1f}M params")
 
-    return whisper, transformer, vae
+    llava_encoder = None
+    clip_encoder = None
+
+    if load_text_encoders:
+        # 4. LLaVA Text Encoder
+        print(f"\n[4/{num_models}] Loading LLaVA...")
+        from sglang.multimodal_gen.runtime.pipelines_core.stages import LLaVATextEncoder
+        llava_encoder = LLaVATextEncoder(LLAVA_PATH, precision="fp16")
+        llava_encoder.to("cuda")
+        print(f"  LLaVA loaded: ~8B params")
+
+        # 5. CLIP Text Encoder
+        print(f"\n[5/{num_models}] Loading CLIP...")
+        from sglang.multimodal_gen.runtime.pipelines_core.stages import CLIPTextEncoder
+        clip_encoder = CLIPTextEncoder(CLIP_PATH, precision="fp16")
+        clip_encoder.to("cuda")
+        print(f"  CLIP loaded")
+
+    return whisper, transformer, vae, llava_encoder, clip_encoder
 
 
 def encode_audio(whisper, audio_path, num_frames, fps=25.0):
@@ -167,11 +193,41 @@ def encode_reference_image(vae, image_path, height, width):
     return ref_latents.to(dtype=torch.bfloat16)
 
 
-def create_text_embeddings(batch_size=1, device="cuda", dtype=torch.bfloat16):
-    """Create text embeddings (dummy for now - real would use LLaVA + CLIP)."""
-    print("\nCreating text embeddings (dummy)...")
-    encoder_hidden_states = torch.randn(batch_size, 256, 4096, device=device, dtype=dtype)
-    pooled_embeds = torch.randn(batch_size, 768, device=device, dtype=dtype)
+def create_text_embeddings(
+    llava_encoder,
+    clip_encoder,
+    prompt: str,
+    ref_image_path: str,
+    batch_size=1,
+    device="cuda",
+    dtype=torch.bfloat16,
+):
+    """Create text embeddings using LLaVA + CLIP or dummy embeddings."""
+    if llava_encoder is None or clip_encoder is None:
+        print("\nCreating text embeddings (dummy)...")
+        encoder_hidden_states = torch.randn(batch_size, 256, 4096, device=device, dtype=dtype)
+        pooled_embeds = torch.randn(batch_size, 768, device=device, dtype=dtype)
+        return encoder_hidden_states, pooled_embeds
+
+    print("\nEncoding text with LLaVA + CLIP...")
+
+    # Load reference image for LLaVA
+    ref_image = Image.open(ref_image_path).convert("RGB")
+
+    # Encode with LLaVA (text + image -> hidden states)
+    print(f"  Encoding with LLaVA: '{prompt[:50]}...' + reference image")
+    encoder_hidden_states = llava_encoder.encode(prompt, image=ref_image)
+    print(f"  LLaVA output shape: {encoder_hidden_states.shape}")
+
+    # Encode with CLIP (text -> pooled embedding)
+    print(f"  Encoding with CLIP...")
+    pooled_embeds = clip_encoder.encode(prompt)
+    print(f"  CLIP output shape: {pooled_embeds.shape}")
+
+    # Convert to target dtype
+    encoder_hidden_states = encoder_hidden_states.to(dtype=dtype)
+    pooled_embeds = pooled_embeds.to(dtype=dtype)
+
     return encoder_hidden_states, pooled_embeds
 
 
@@ -306,6 +362,47 @@ def save_video(video, output_path, fps=25):
     print(f"  Saved {len(video)} frames at {fps} FPS")
 
 
+def load_text_encoders_and_encode(prompt, ref_image_path, device, dtype):
+    """Load text encoders, encode, then offload to free memory for transformer."""
+    print("\n" + "=" * 60)
+    print("Text Encoding (LLaVA + CLIP)")
+    print("=" * 60)
+
+    # Load LLaVA
+    print("\n[1/2] Loading LLaVA...")
+    from sglang.multimodal_gen.runtime.pipelines_core.stages import LLaVATextEncoder
+    llava_encoder = LLaVATextEncoder(LLAVA_PATH, precision="fp16")
+    llava_encoder.to("cuda")
+    print(f"  LLaVA loaded: ~8B params")
+
+    # Load CLIP
+    print("\n[2/2] Loading CLIP...")
+    from sglang.multimodal_gen.runtime.pipelines_core.stages import CLIPTextEncoder
+    clip_encoder = CLIPTextEncoder(CLIP_PATH, precision="fp16")
+    clip_encoder.to("cuda")
+    print(f"  CLIP loaded")
+
+    # Encode
+    encoder_hidden_states, pooled_embeds = create_text_embeddings(
+        llava_encoder=llava_encoder,
+        clip_encoder=clip_encoder,
+        prompt=prompt,
+        ref_image_path=ref_image_path,
+        device=device,
+        dtype=dtype,
+    )
+
+    # Offload to free GPU memory
+    print("\n  Offloading text encoders...")
+    llava_encoder.to("cpu")
+    clip_encoder.to("cpu")
+    del llava_encoder, clip_encoder
+    torch.cuda.empty_cache()
+    print("  Text encoders offloaded")
+
+    return encoder_hidden_states, pooled_embeds
+
+
 def main():
     print("=" * 60)
     print("HunyuanVideo-Avatar Full Video Generation")
@@ -329,6 +426,9 @@ def main():
     num_steps = 30
     guidance_scale = 7.5
 
+    # Text prompt for the video
+    prompt = "A person talking naturally with expressive facial movements."
+
     latent_t = (num_frames - 1) // 4 + 1
     latent_h, latent_w = height // 8, width // 8
     latent_c = 16
@@ -337,24 +437,43 @@ def main():
     print(f"  Resolution: {width}x{height}")
     print(f"  Frames: {num_frames} (latent: {latent_t})")
     print(f"  Steps: {num_steps}, CFG: {guidance_scale}")
+    print(f"  Text encoders: {'LLaVA + CLIP' if USE_REAL_TEXT_ENCODERS else 'Dummy'}")
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
-    # Load models
-    whisper, transformer, vae = load_models()
+    # Step 1: Encode text with LLaVA + CLIP FIRST (before loading transformer)
+    # This is done first because LLaVA (8B) + Transformer (13B) won't fit together
+    if USE_REAL_TEXT_ENCODERS:
+        encoder_hidden_states, pooled_embeds = load_text_encoders_and_encode(
+            prompt=prompt,
+            ref_image_path=SAMPLE_IMAGE,
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        encoder_hidden_states, pooled_embeds = create_text_embeddings(
+            llava_encoder=None,
+            clip_encoder=None,
+            prompt=prompt,
+            ref_image_path=SAMPLE_IMAGE,
+            device=device,
+            dtype=dtype,
+        )
 
-    # Encode inputs
+    # Step 2: Load remaining models (Whisper, Transformer, VAE)
+    whisper, transformer, vae, _, _ = load_models(load_text_encoders=False)
+
+    # Step 3: Encode audio
     audio_embeds = encode_audio(whisper, SAMPLE_AUDIO, num_frames, fps)
 
     # Free Whisper memory
     del whisper
     torch.cuda.empty_cache()
 
+    # Step 4: Encode reference image
     ref_latents = encode_reference_image(vae, SAMPLE_IMAGE, height, width)
     ref_latents = ref_latents.repeat(1, 1, latent_t, 1, 1)
-
-    encoder_hidden_states, pooled_embeds = create_text_embeddings(device=device, dtype=dtype)
 
     # Create initial noise
     print("\nPreparing initial latents...")
