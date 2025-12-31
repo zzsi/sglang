@@ -41,10 +41,9 @@ class HunyuanAvatarConfig(HunyuanConfig):
     flow_shift: int = 7
 
     # Audio encoder configuration
-    # Note: Whisper encoder is handled separately in the pipeline
-    # because it processes audio, not text
-    audio_encoder_path: str = "whisper-tiny"
-    audio_encoder_precision: str = "fp16"
+    # Whisper encoder for audio-to-embedding conversion
+    # Can be HuggingFace model ID (e.g., "openai/whisper-tiny") or local path
+    audio_encoder_path: str = "openai/whisper-tiny"
 
     # Whether to load audio encoder (can be disabled if using pre-computed embeddings)
     load_audio_encoder: bool = True

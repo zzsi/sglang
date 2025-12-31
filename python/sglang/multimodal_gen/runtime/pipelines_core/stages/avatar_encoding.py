@@ -199,28 +199,177 @@ class ReferenceImageEncodingStage(PipelineStage):
         return result
 
 
+class WhisperAudioEncoder:
+    """
+    Whisper-based audio encoder for HunyuanVideo-Avatar.
+
+    Encodes audio files into embeddings compatible with the avatar transformer.
+    Output shape: (batch, num_frames, seq_len=10, blocks=5, channels=384)
+    """
+
+    def __init__(self, whisper_path: str):
+        """
+        Initialize Whisper encoder.
+
+        Args:
+            whisper_path: Path to Whisper model (e.g., "openai/whisper-tiny" or local path)
+        """
+        from transformers import WhisperModel, AutoFeatureExtractor
+
+        self.whisper = WhisperModel.from_pretrained(whisper_path)
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(whisper_path)
+        self.device = None
+
+    def to(self, device):
+        """Move model to device."""
+        self.device = device
+        self.whisper = self.whisper.to(device)
+        return self
+
+    def encode(
+        self,
+        audio_path: str,
+        num_frames: int,
+        fps: float = 25.0,
+    ) -> torch.Tensor:
+        """
+        Encode audio file to embeddings.
+
+        Args:
+            audio_path: Path to audio file
+            num_frames: Number of video frames to generate
+            fps: Video frame rate (25 or 12.5)
+
+        Returns:
+            Audio embeddings with shape (1, num_frames, 10, 5, 384)
+        """
+        import librosa
+
+        # Load audio at 16kHz
+        audio_input, sr = librosa.load(audio_path, sr=16000)
+        assert sr == 16000, f"Expected 16kHz, got {sr}Hz"
+
+        # Extract mel features using Whisper's feature extractor
+        # Process in chunks of 750*640 samples (30 seconds)
+        window = 750 * 640
+        audio_features = []
+        for i in range(0, len(audio_input), window):
+            chunk = audio_input[i:i + window]
+            features = self.feature_extractor(
+                chunk,
+                sampling_rate=sr,
+                return_tensors="pt",
+            ).input_features
+            audio_features.append(features)
+
+        audio_features = torch.cat(audio_features, dim=-1)
+
+        # Encode with Whisper encoder (take first 3000 frames = 30s max)
+        audio_features = audio_features[:, :, :3000].to(
+            self.device, dtype=self.whisper.dtype
+        )
+
+        with torch.no_grad():
+            encoder_outputs = self.whisper.encoder(
+                audio_features,
+                output_hidden_states=True,
+            )
+            hidden_states = encoder_outputs.hidden_states
+
+        # Stack hidden states: (batch, seq, layers, hidden)
+        audio_feats = torch.stack(hidden_states, dim=2)
+
+        # Pad with zeros at the beginning (matching original implementation)
+        audio_feats = torch.cat(
+            [torch.zeros_like(audio_feats[:, :4]), audio_feats], dim=1
+        )
+
+        # Extract per-frame audio embeddings
+        # For 25 fps: step_ts = 1, for 12.5 fps: step_ts = 2
+        step_ts = 1 if fps == 25 else 2
+
+        audio_prompts = []
+        for f in range(num_frames):
+            cur_t = f * step_ts * 2  # Multiply by 2 for audio-video alignment
+            # Window of 10 timesteps
+            audio_clip = audio_feats[:, cur_t:cur_t + 10]
+            if audio_clip.shape[1] < 10:
+                # Pad if needed
+                pad = torch.zeros(
+                    audio_clip.shape[0],
+                    10 - audio_clip.shape[1],
+                    *audio_clip.shape[2:],
+                    device=audio_clip.device,
+                    dtype=audio_clip.dtype,
+                )
+                audio_clip = torch.cat([audio_clip, pad], dim=1)
+            audio_prompts.append(audio_clip)
+
+        # Stack: (batch, num_frames, 10, layers, hidden)
+        audio_prompts = torch.stack(audio_prompts, dim=1)
+
+        # Select/pad to 5 layers (Whisper-tiny has 4 layers)
+        num_layers = audio_prompts.shape[3]
+        if num_layers < 5:
+            pad_layers = 5 - num_layers
+            last_layer = audio_prompts[:, :, :, -1:, :]
+            audio_prompts = torch.cat(
+                [audio_prompts, last_layer.repeat(1, 1, 1, pad_layers, 1)], dim=3
+            )
+        else:
+            audio_prompts = audio_prompts[:, :, :, :5, :]
+
+        # Final shape: (batch, num_frames, 10, 5, 384)
+        return audio_prompts
+
+
 class AudioEncodingStage(PipelineStage):
     """
     Stage for encoding audio into embeddings for avatar generation.
 
     This stage either:
     1. Uses pre-computed audio embeddings from batch.extra["audio_embeds"]
-    2. Encodes audio from batch.extra["audio_path"] using Whisper (if encoder provided)
+    2. Encodes audio from batch.extra["audio_path"] using Whisper
 
     The audio embeddings are stored in batch.extra["audio_embeds"].
     """
 
-    def __init__(self, audio_encoder=None, **kwargs) -> None:
+    def __init__(self, audio_encoder=None, whisper_path: str | None = None, **kwargs) -> None:
+        """
+        Initialize audio encoding stage.
+
+        Args:
+            audio_encoder: Optional pre-initialized audio encoder
+            whisper_path: Path to Whisper model (used if audio_encoder is None)
+        """
         super().__init__()
         self.audio_encoder = audio_encoder
+        self.whisper_path = whisper_path
+        self._whisper_encoder = None
+
+    def _get_whisper_encoder(self) -> WhisperAudioEncoder | None:
+        """Lazily initialize Whisper encoder."""
+        if self._whisper_encoder is not None:
+            return self._whisper_encoder
+
+        if self.audio_encoder is not None:
+            return self.audio_encoder
+
+        if self.whisper_path is not None:
+            logger.info(f"Loading Whisper encoder from {self.whisper_path}")
+            self._whisper_encoder = WhisperAudioEncoder(self.whisper_path)
+            return self._whisper_encoder
+
+        return None
 
     def load_model(self):
-        if self.audio_encoder is not None:
-            self.audio_encoder = self.audio_encoder.to(get_local_torch_device())
+        encoder = self._get_whisper_encoder()
+        if encoder is not None:
+            encoder.to(get_local_torch_device())
 
     def offload_model(self):
-        if self.audio_encoder is not None and self.server_args.vae_cpu_offload:
-            self.audio_encoder = self.audio_encoder.to("cpu")
+        if self._whisper_encoder is not None and self.server_args.vae_cpu_offload:
+            self._whisper_encoder.to("cpu")
 
     def forward(
         self,
@@ -255,40 +404,32 @@ class AudioEncodingStage(PipelineStage):
             logger.warning("No audio input provided for avatar generation")
             return batch
 
-        if self.audio_encoder is None:
+        # Get or create Whisper encoder
+        encoder = self._get_whisper_encoder()
+        if encoder is None:
             raise ValueError(
                 "Audio path provided but no audio encoder available. "
-                "Either provide pre-computed audio_embeds or configure audio encoder."
+                "Either provide pre-computed audio_embeds, pass whisper_path, "
+                "or configure audio encoder."
             )
 
         self.load_model()
 
-        # Load and encode audio
-        # Note: This is a placeholder for Whisper encoding
-        # The actual implementation depends on the Whisper model interface
+        # Get encoding parameters
+        num_frames = batch.num_frames
+        fps = batch.extra.get("fps", 25.0)
+
         try:
-            import librosa
-            import numpy as np
-
-            # Load audio
-            audio, sr = librosa.load(audio_path, sr=16000)
-
-            # Convert to tensor
-            audio_tensor = torch.from_numpy(audio).unsqueeze(0).to(get_local_torch_device())
-
-            # Encode with Whisper
-            # The output shape should be (batch, num_frames, seq_len, blocks, channels)
-            # This depends on the specific Whisper encoder implementation
             with torch.no_grad():
-                audio_embeds = self.audio_encoder(audio_tensor)
+                audio_embeds = encoder.encode(audio_path, num_frames, fps)
 
             batch.extra["audio_embeds"] = audio_embeds
-            logger.debug(f"Audio encoded to embeddings with shape: {audio_embeds.shape}")
+            logger.info(f"Audio encoded to embeddings with shape: {audio_embeds.shape}")
 
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
-                "librosa is required for audio encoding. "
-                "Install with: pip install librosa"
+                f"Missing dependency for audio encoding: {e}. "
+                "Install with: pip install librosa transformers"
             )
         except Exception as e:
             logger.error(f"Failed to encode audio: {e}")

@@ -96,10 +96,14 @@ class HunyuanVideoAvatarPipeline(ComposedPipelineBase):
         # 4. Audio encoding (Whisper or pre-computed)
         # Note: audio_encoder is optional - can use pre-computed embeddings
         audio_encoder = self.get_module("audio_encoder", required=False)
+        whisper_path = getattr(
+            server_args.pipeline_config, "audio_encoder_path", None
+        )
         self.add_stage(
             stage_name="audio_encoding_stage",
             stage=AudioEncodingStage(
                 audio_encoder=audio_encoder,
+                whisper_path=whisper_path,
             ),
         )
 
