@@ -8,7 +8,6 @@ for avatar generation.
 
 from typing import Optional
 
-import numpy as np
 import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -381,20 +380,7 @@ class LLaVATextEncoder:
             padding_side="right",
         )
 
-        # Image processor for LLaVA's CLIP vision encoder
-        from transformers import AutoProcessor
-        try:
-            processor = AutoProcessor.from_pretrained(model_path)
-            self.image_processor = processor.image_processor
-        except Exception:
-            from transformers import CLIPImageProcessor
-            self.image_processor = CLIPImageProcessor.from_pretrained(model_path)
-
         self.device = None
-
-        # Number of image tokens that LLaVA uses (576 patches for 336x336 with patch_size=14)
-        # Plus some additional tokens for separators = 575
-        self.num_image_tokens = 575
 
     def to(self, device):
         """Move model to device."""
@@ -641,141 +627,6 @@ class CLIPTextEncoder:
 
         # Return pooler output (CLS token embedding)
         return outputs.pooler_output
-
-
-class AvatarTextEncodingStage(PipelineStage):
-    """
-    Combined text encoding stage for HunyuanVideo-Avatar.
-
-    Uses LLaVA for main hidden states (with reference image injection)
-    and CLIP for pooled embeddings.
-    """
-
-    def __init__(
-        self,
-        llava_path: Optional[str] = None,
-        clip_path: Optional[str] = None,
-        precision: str = "fp16",
-        **kwargs,
-    ) -> None:
-        """
-        Initialize avatar text encoding stage.
-
-        Args:
-            llava_path: Path to LLaVA model
-            clip_path: Path to CLIP model
-            precision: Model precision
-        """
-        super().__init__()
-        self.llava_path = llava_path
-        self.clip_path = clip_path
-        self.precision = precision
-        self._llava_encoder: Optional[LLaVATextEncoder] = None
-        self._clip_encoder: Optional[CLIPTextEncoder] = None
-
-    def _get_llava_encoder(self) -> Optional[LLaVATextEncoder]:
-        """Lazily initialize LLaVA encoder."""
-        if self._llava_encoder is not None:
-            return self._llava_encoder
-        if self.llava_path is not None:
-            self._llava_encoder = LLaVATextEncoder(self.llava_path, self.precision)
-            return self._llava_encoder
-        return None
-
-    def _get_clip_encoder(self) -> Optional[CLIPTextEncoder]:
-        """Lazily initialize CLIP encoder."""
-        if self._clip_encoder is not None:
-            return self._clip_encoder
-        if self.clip_path is not None:
-            self._clip_encoder = CLIPTextEncoder(self.clip_path, self.precision)
-            return self._clip_encoder
-        return None
-
-    def load_model(self):
-        llava = self._get_llava_encoder()
-        if llava is not None:
-            llava.to(get_local_torch_device())
-
-        clip = self._get_clip_encoder()
-        if clip is not None:
-            clip.to(get_local_torch_device())
-
-    def offload_model(self):
-        if self._llava_encoder is not None:
-            self._llava_encoder.to("cpu")
-        if self._clip_encoder is not None:
-            self._clip_encoder.to("cpu")
-        torch.cuda.empty_cache()
-
-    def forward(
-        self,
-        batch: Req,
-        server_args: ServerArgs,
-    ) -> Req:
-        """
-        Encode text with LLaVA (+ reference image) and CLIP.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with prompt embeddings populated.
-        """
-        prompt = batch.prompt
-        if prompt is None:
-            prompt = ""
-
-        # Get reference image for LLaVA
-        ref_image = batch.extra.get("ref_image", batch.condition_image)
-
-        self.load_model()
-
-        # Encode with LLaVA
-        llava = self._get_llava_encoder()
-        if llava is not None:
-            hidden_states = llava.encode(prompt, image=ref_image)
-            batch.prompt_embeds.append(hidden_states)
-            logger.debug(f"LLaVA hidden states shape: {hidden_states.shape}")
-
-            # Encode negative prompt if CFG is enabled
-            if batch.do_classifier_free_guidance:
-                neg_prompt = batch.negative_prompt or ""
-                # For negative, don't include image (or use zeros)
-                neg_hidden_states = llava.encode(neg_prompt, image=None)
-                if batch.negative_prompt_embeds is not None:
-                    batch.negative_prompt_embeds.append(neg_hidden_states)
-
-        # Encode with CLIP for pooled embeddings
-        clip = self._get_clip_encoder()
-        if clip is not None:
-            pooled_embeds = clip.encode(prompt)
-            batch.pooled_embeds.append(pooled_embeds)
-            logger.debug(f"CLIP pooled embeds shape: {pooled_embeds.shape}")
-
-            if batch.do_classifier_free_guidance:
-                neg_prompt = batch.negative_prompt or ""
-                neg_pooled_embeds = clip.encode(neg_prompt)
-                batch.neg_pooled_embeds.append(neg_pooled_embeds)
-
-        self.offload_model()
-        return batch
-
-    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        """Verify text encoding stage inputs."""
-        result = VerificationResult()
-        result.add_check("prompt", batch.prompt, lambda x: x is None or isinstance(x, str))
-        return result
-
-    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        """Verify text encoding stage outputs."""
-        result = VerificationResult()
-        result.add_check(
-            "prompt_embeds",
-            batch.prompt_embeds,
-            lambda x: len(x) > 0,
-        )
-        return result
 
 
 class AudioEncodingStage(PipelineStage):

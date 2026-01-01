@@ -72,23 +72,21 @@ def init_distributed():
     return server_args
 
 
-def load_models(load_text_encoders=True):
-    """Load all required models."""
+def load_models():
+    """Load Whisper, Transformer, and VAE."""
     print("\n" + "=" * 60)
     print("Loading Models")
     print("=" * 60)
 
-    num_models = 5 if load_text_encoders else 3
-
     # 1. Whisper
-    print(f"\n[1/{num_models}] Loading Whisper...")
+    print("\n[1/3] Loading Whisper...")
     from sglang.multimodal_gen.runtime.pipelines_core.stages import WhisperAudioEncoder
     whisper = WhisperAudioEncoder(WHISPER_PATH)
     whisper.to("cuda")
-    print(f"  Whisper loaded")
+    print("  Whisper loaded")
 
     # 2. Transformer
-    print(f"\n[2/{num_models}] Loading Avatar Transformer...")
+    print("\n[2/3] Loading Avatar Transformer...")
     from sglang.multimodal_gen.runtime.models.dits.hunyuanvideo_avatar import (
         HunyuanVideoAvatarTransformer,
         HunyuanVideoAvatarConfig,
@@ -106,7 +104,7 @@ def load_models(load_text_encoders=True):
     print(f"  Transformer loaded: {sum(p.numel() for p in transformer.parameters()) / 1e9:.2f}B params")
 
     # 3. VAE
-    print(f"\n[3/{num_models}] Loading VAE...")
+    print("\n[3/3] Loading VAE...")
     from diffusers import AutoencoderKLHunyuanVideo
     vae = AutoencoderKLHunyuanVideo(
         in_channels=3,
@@ -138,25 +136,7 @@ def load_models(load_text_encoders=True):
     vae.eval()
     print(f"  VAE loaded: {sum(p.numel() for p in vae.parameters()) / 1e6:.1f}M params")
 
-    llava_encoder = None
-    clip_encoder = None
-
-    if load_text_encoders:
-        # 4. LLaVA Text Encoder
-        print(f"\n[4/{num_models}] Loading LLaVA...")
-        from sglang.multimodal_gen.runtime.pipelines_core.stages import LLaVATextEncoder
-        llava_encoder = LLaVATextEncoder(LLAVA_PATH, precision="fp16")
-        llava_encoder.to("cuda")
-        print(f"  LLaVA loaded: ~8B params")
-
-        # 5. CLIP Text Encoder
-        print(f"\n[5/{num_models}] Loading CLIP...")
-        from sglang.multimodal_gen.runtime.pipelines_core.stages import CLIPTextEncoder
-        clip_encoder = CLIPTextEncoder(CLIP_PATH, precision="fp16")
-        clip_encoder.to("cuda")
-        print(f"  CLIP loaded")
-
-    return whisper, transformer, vae, llava_encoder, clip_encoder
+    return whisper, transformer, vae
 
 
 def encode_audio(whisper, audio_path, num_frames, fps=25.0):
@@ -462,7 +442,7 @@ def main():
         )
 
     # Step 2: Load remaining models (Whisper, Transformer, VAE)
-    whisper, transformer, vae, _, _ = load_models(load_text_encoders=False)
+    whisper, transformer, vae = load_models()
 
     # Step 3: Encode audio
     audio_embeds = encode_audio(whisper, SAMPLE_AUDIO, num_frames, fps)
