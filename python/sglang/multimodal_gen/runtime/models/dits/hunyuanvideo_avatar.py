@@ -423,7 +423,11 @@ class HunyuanVideoAvatarTransformer(CachableDiT, OffloadableDiTMixin):
             ref_first_embedded = self.img_in(ref_latents_first)
 
             # Add projected reference to img
+            # ref_proj: [B, spatial_tokens, hidden], img: [B, temporal*spatial_tokens, hidden]
+            # Expand ref_proj across temporal dimension to match img
             ref_proj, _ = self.before_proj(ref_embedded)
+            num_temporal_frames = img.shape[1] // ref_proj.shape[1]
+            ref_proj = ref_proj.repeat(1, num_temporal_frames, 1)
             img = img + ref_proj
 
             # Concatenate ref_first to beginning of sequence
