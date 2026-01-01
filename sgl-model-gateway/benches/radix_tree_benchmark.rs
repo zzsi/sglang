@@ -64,6 +64,41 @@ const CONVERSATION_PREFIXES: [&str; 6] = [
     "### Instruction:\n",
 ];
 
+/// Common token prefixes that create shared tree paths (mirrors CONVERSATION_PREFIXES)
+/// These simulate tokenized versions of common system prompts
+const TOKEN_PREFIXES: [[TokenId; 20]; 6] = [
+    // Simulates "<|system|>\nYou are a helpful assistant.\n<|user|>\n"
+    [
+        100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 1600,
+        1700, 1800, 1900, 2000,
+    ],
+    // Simulates "<|im_start|>system\nYou are a helpful AI assistant.<|im_end|>\n<|im_start|>user\n"
+    [
+        101, 201, 301, 401, 501, 601, 701, 801, 901, 1001, 1101, 1201, 1301, 1401, 1501, 1601,
+        1701, 1801, 1901, 2001,
+    ],
+    // Simulates "[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\n\n"
+    [
+        102, 202, 302, 402, 502, 602, 702, 802, 902, 1002, 1102, 1202, 1302, 1402, 1502, 1602,
+        1702, 1802, 1902, 2002,
+    ],
+    // Simulates "Human: "
+    [
+        103, 203, 303, 403, 503, 603, 703, 803, 903, 1003, 1103, 1203, 1303, 1403, 1503, 1603,
+        1703, 1803, 1903, 2003,
+    ],
+    // Simulates "User: "
+    [
+        104, 204, 304, 404, 504, 604, 704, 804, 904, 1004, 1104, 1204, 1304, 1404, 1504, 1604,
+        1704, 1804, 1904, 2004,
+    ],
+    // Simulates "### Instruction:\n"
+    [
+        105, 205, 305, 405, 505, 605, 705, 805, 905, 1005, 1105, 1205, 1305, 1405, 1505, 1605,
+        1705, 1805, 1905, 2005,
+    ],
+];
+
 /// Token ID type
 type TokenId = u32;
 
@@ -508,10 +543,11 @@ fn bench_summary(c: &mut Criterion) {
                             let worker = workers_ref[t % workers_ref.len()].clone();
                             thread::spawn(move || {
                                 for i in 0..OPS_PER_THREAD {
-                                    // Generate deterministic token sequence
-                                    let tokens: Vec<TokenId> = (0..50)
-                                        .map(|j| (t * 10000 + i * 100 + j) as u32)
-                                        .collect();
+                                    // Use shared prefix + unique suffix (mirrors StringTree's CONVERSATION_PREFIXES pattern)
+                                    let prefix = &TOKEN_PREFIXES[i % TOKEN_PREFIXES.len()];
+                                    let mut tokens: Vec<TokenId> = prefix.to_vec();
+                                    // Add unique suffix tokens
+                                    tokens.extend((0..30).map(|j| (t * 10000 + i * 100 + j) as u32));
                                     if i % 3 == 0 {
                                         tree.prefix_match_legacy(&tokens);
                                     } else {
